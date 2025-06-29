@@ -1,0 +1,88 @@
+name: Deployment
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  semgrep:
+    name: Semgrep SAST Scan
+    runs-on: ubuntu-latest
+    env:
+      SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - run: semgrep ci
+
+  vercel:
+    name: Vercel Deployment
+    needs: semgrep
+    runs-on: ubuntu-latest
+    outputs:
+      preview_url: ${{ steps.vercel_deploy.outputs.preview-url }}
+      prod_url: ${{ steps.get_prod.outputs.prod_url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Install & Build
+        run: |
+          npm install
+          npm run build
+
+      - name: Deploy to Vercel
+        id: vercel_deploy
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
+
+      - name: Get Prod URL
+        id: get_prod
+        run: |
+          RESPONSE=$(curl -s -H "Authorization: Bearer ${{ secrets.VERCEL_TOKEN }}" \
+          "https://api.vercel.com/v9/projects/${{ secrets.VERCEL_PROJECT_ID }}/domains")
+          URL=$(echo "$RESPONSE" | jq -r '.domains[0].name')
+          echo "prod_url=https://$URL" >> $GITHUB_OUTPUT
+
+  zap:
+    name: OWASP ZAP DAST Scan
+    needs: vercel
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull ZAP Image
+        run: docker pull zaproxy/zap-stable
+
+      - name: Run ZAP Scan
+        run: |
+          TIMESTAMP=$(date +%s)
+          REPORT_NAME="zap-report-$TIMESTAMP.html"
+          TARGET_URL=${{ needs.vercel.outputs.prod_url }}
+
+          mkdir -p "$HOME/zap-reports"
+
+          docker run --rm -u root -v "$HOME/zap-reports":/zap/wrk zaproxy/zap-stable zap-baseline.py \
+          -t "$TARGET_URL" -r "$REPORT_NAME" -I
+
+          echo "REPORT_NAME=$REPORT_NAME" >> $GITHUB_ENV
+          echo "REPORT_LOCATION=$HOME/zap-reports" >> $GITHUB_ENV
+
+      - name: Upload ZAP Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: ${{ env.REPORT_LOCATION }}/${{ env.REPORT_NAME }}
